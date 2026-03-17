@@ -1,0 +1,268 @@
+"""
+losses.py — All loss functions for the four experiments.
+
+Land mask handling
+------------------
+CHIRPS has NaN over ocean. In data_loader.py these are stored as -1.
+Every loss below masks out pixels where y_true < 0 before computing
+any statistics, so the ocean never contributes to gradients.
+
+Loss summary
+------------
+1. masked_mse          – pixel-wise MSE over land only
+2. bernoulli_gamma_nll – negative log-likelihood of Bernoulli-Gamma
+                         mixture model (Rampal et al.)
+3. compound_loss       – MSE + weighted sum of FSS' at 3 percentiles
+                         (Ascenso et al. eq. 2)
+4. wgan_generator_loss – Wasserstein adversarial loss + compound loss
+   wgan_gp             – gradient penalty for discriminator
+"""
+
+import math
+import numpy as np
+import tensorflow as tf
+import tensorflow_probability as tfp
+import config as C
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility: build land mask tensor from y_true
+# ─────────────────────────────────────────────────────────────────────────────
+def _land_mask(y_true):
+    """Return float32 mask (1 = land, 0 = ocean/missing)."""
+    return tf.cast(y_true >= 0.0, tf.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Masked MSE
+# ─────────────────────────────────────────────────────────────────────────────
+def masked_mse(y_true, y_pred):
+    """
+    Mean squared error computed only over land pixels.
+    y_true: (B, H, W, 1), ocean encoded as -1
+    y_pred: (B, H, W, 1)
+    """
+    mask  = _land_mask(y_true)
+    diff  = (y_true - y_pred) ** 2
+    # Replace ocean pixels with 0 before averaging
+    n_land = tf.reduce_sum(mask) + 1e-8
+    return tf.reduce_sum(diff * mask) / n_land
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Bernoulli-Gamma negative log-likelihood  (Rampal et al. 2022)
+# ─────────────────────────────────────────────────────────────────────────────
+def bernoulli_gamma_nll(y_true, y_pred_combined):
+    """
+    Negative log-likelihood of the Bernoulli-Gamma mixture model.
+
+    Model
+    -----
+    P(R=0)     = 1 - p                    (dry probability)
+    P(R=r | r>0) = Gamma(r; alpha, beta)  (wet amount)
+
+    The model head must output 3 channels:
+      channel 0 : p     (probability of rain)  — sigmoid activation
+      channel 1 : alpha (shape of Gamma)       — softplus activation
+      channel 2 : beta  (rate  of Gamma)       — softplus activation
+
+    Parameters
+    ----------
+    y_true          : (B, H, W, 1)  CHIRPS rainfall, ocean = -1
+    y_pred_combined : (B, H, W, 3)  [p, alpha, beta]
+    """
+    # Split predictions
+    p     = y_pred_combined[..., 0:1]   # (B, H, W, 1)
+    alpha = y_pred_combined[..., 1:2]
+    beta  = y_pred_combined[..., 2:3]
+
+    mask  = _land_mask(y_true)                       # (B, H, W, 1)
+    r_obs = tf.maximum(y_true, 0.0)                  # clip ocean to 0
+
+    # Wet/dry indicator
+    wet  = tf.cast(r_obs > C.RAIN_THRESHOLD, tf.float32)
+    dry  = 1.0 - wet
+
+    # Bernoulli log-likelihood
+    eps = 1e-7
+    p_clipped = tf.clip_by_value(p, eps, 1.0 - eps)
+    ll_bern   = (wet  * tf.math.log(p_clipped) +
+                 dry  * tf.math.log(1.0 - p_clipped))
+
+    # Gamma log-likelihood (only for wet pixels)
+    # log p(r | alpha, beta) = (alpha-1)*log(r) - beta*r + alpha*log(beta)
+    #                          - log(Gamma(alpha))
+    r_safe    = tf.maximum(r_obs, eps)
+    ll_gamma  = ((alpha - 1.0) * tf.math.log(r_safe)
+                 - beta * r_safe
+                 + alpha * tf.math.log(beta + eps)
+                 - tf.math.lgamma(alpha + eps))
+
+    # Combined: for dry pixels use only Bernoulli; for wet add Gamma
+    ll = ll_bern + wet * ll_gamma
+
+    # Average negative log-likelihood over land only
+    n_land = tf.reduce_sum(mask) + 1e-8
+    return -tf.reduce_sum(ll * mask) / n_land
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Compound loss: FSS' + MSE  (Ascenso et al. 2024, eq. 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _soft_binary(x, threshold):
+    """
+    Differentiable soft thresholding using arctan (eq. 1 in Ascenso et al.).
+    Approximates a hard binary map: 1 where x > threshold, 0 elsewhere.
+    """
+    eps = 1e-7
+    activation = eps + (1.0 - 2.0 * eps) * (
+        0.5 + tf.math.atan(x - threshold) / tf.constant(math.pi)
+    )
+    return activation
+
+
+def _normalise_map(x):
+    """Min-max normalise a tensor to [0, 1]."""
+    xmin = tf.reduce_min(x)
+    xmax = tf.reduce_max(x)
+    return (x - xmin) / (xmax - xmin + 1e-7)
+
+
+def _fss_single(y_true_s, y_pred_s, q, n):
+    """
+    Compute FSS' for one (image, prediction) pair at percentile q,
+    neighbourhood size n.
+
+    y_true_s, y_pred_s : (1, H, W, 1)  — single sample, land pixels only
+    q                  : percentile (0-100)
+    n                  : neighbourhood side length (odd integer)
+    """
+    # Compute percentile thresholds (separately for true and pred)
+    thr_t = tfp.stats.percentile(y_true_s, q=q) + 1e-7
+    thr_p = tfp.stats.percentile(y_pred_s, q=q) + 1e-7
+
+    # Soft binary fields
+    bin_t = _soft_binary(y_true_s, thr_t)
+    bin_p = _soft_binary(y_pred_s, thr_p)
+    bin_t = _normalise_map(bin_t)
+    bin_p = _normalise_map(bin_p)
+
+    # Uniform averaging kernel  (n × n)
+    kernel = tf.constant(
+        np.ones((n, n, 1, 1), dtype=np.float32) / (n * n),
+        dtype=tf.float32
+    )
+    frac_t = tf.nn.conv2d(bin_t, kernel, strides=[1,1,1,1], padding="SAME")
+    frac_p = tf.nn.conv2d(bin_p, kernel, strides=[1,1,1,1], padding="SAME")
+
+    # Fractions Skill Score numerator / denominator
+    num   = tf.reduce_mean(tf.square(frac_p - frac_t))
+    denom = tf.reduce_mean(tf.square(frac_p) + tf.square(frac_t)) + 1e-7
+
+    # Return FSS' = num/denom  (lower is better → used directly as loss term)
+    return num / denom
+
+
+def fss_loss_batch(y_true, y_pred, q, n=C.FSS_N):
+    """
+    Compute mean FSS' across all samples in the batch.
+    Ocean pixels (y_true < 0) are set to 0 before computing FSS.
+    """
+    # Mask ocean
+    mask   = tf.cast(y_true >= 0, tf.float32)
+    yt_land = y_true * mask    # ocean → 0
+    yp_land = y_pred * mask
+
+    B = tf.shape(yt_land)[0]
+
+    def _body(i):
+        yt_s = yt_land[i:i+1]
+        yp_s = yp_land[i:i+1]
+        return _fss_single(yt_s, yp_s, q, n)
+
+    # Loop over batch items (tf.map_fn alternative using while_loop)
+    fss_vals = tf.vectorized_map(
+        lambda pair: _fss_single(pair[0:1], pair[1:1], q, n),
+        (yt_land, yp_land)
+    )
+    # Simpler: use tf.map_fn
+    fss_vals = tf.map_fn(
+        lambda pair: _fss_single(
+            tf.expand_dims(pair[0], 0),
+            tf.expand_dims(pair[1], 0),
+            q, n
+        ),
+        (yt_land, yp_land),
+        fn_output_signature=tf.float32
+    )
+    return tf.reduce_mean(fss_vals)
+
+
+def compound_loss(y_true, y_pred,
+                  fss_weight=C.COMPOUND_FSS_WEIGHT,
+                  mse_weight=C.COMPOUND_MSE_WEIGHT,
+                  percentiles=C.FSS_PERCENTILES,
+                  n=C.FSS_N):
+    """
+    L_cmpd = fss_weight * (FSS'_80 + FSS'_95 + FSS'_99)  +  mse_weight * MSE
+    (Ascenso et al. 2024, eq. 2)
+    """
+    mse_term = masked_mse(y_true, y_pred)
+
+    fss_total = tf.constant(0.0)
+    for q in percentiles:
+        fss_total = fss_total + fss_loss_batch(y_true, y_pred, q=q, n=n)
+
+    return fss_weight * fss_total + mse_weight * mse_term
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. WGAN-GP losses
+# ─────────────────────────────────────────────────────────────────────────────
+
+def wasserstein_generator_loss(fake_logits):
+    """Generator loss: maximise critic score on fakes = minimise -E[D(fake)]."""
+    return -tf.reduce_mean(fake_logits)
+
+
+def wasserstein_discriminator_loss(real_logits, fake_logits):
+    """Critic loss: maximise E[D(real)] - E[D(fake)]."""
+    return tf.reduce_mean(fake_logits) - tf.reduce_mean(real_logits)
+
+
+def gradient_penalty(discriminator, real_samples, fake_samples,
+                     lam=C.WGAN_GP_LAMBDA):
+    """
+    Gradient penalty term (Gulrajani et al. 2017).
+    Enforces Lipschitz constraint on the critic.
+
+    real_samples : (B, H, W, 1)  CHIRPS patches
+    fake_samples : (B, H, W, 1)  generator output
+    """
+    B = tf.shape(real_samples)[0]
+    alpha = tf.random.uniform([B, 1, 1, 1], 0.0, 1.0)
+    interpolated = real_samples + alpha * (fake_samples - real_samples)
+
+    with tf.GradientTape() as tape:
+        tape.watch(interpolated)
+        pred = discriminator(interpolated, training=True)
+
+    grads  = tape.gradient(pred, interpolated)
+    norm   = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2, 3]) + 1e-12)
+    penalty = tf.reduce_mean((norm - 1.0) ** 2)
+    return lam * penalty
+
+
+def wgan_generator_loss_total(fake_logits, y_true, y_pred_rainfall,
+                               adv_weight=1.0, cmpd_weight=10.0):
+    """
+    Full generator loss = adversarial + compound.
+    The compound loss anchors the generator to realistic rainfall amounts
+    while the adversarial loss sharpens spatial structure.
+
+    adv_weight  : weight on Wasserstein adversarial term
+    cmpd_weight : weight on compound loss term (tune if needed)
+    """
+    adv_loss  = wasserstein_generator_loss(fake_logits)
+    cmpd      = compound_loss(y_true, y_pred_rainfall)
+    return adv_weight * adv_loss + cmpd_weight * cmpd

@@ -1,0 +1,10 @@
+# requirements.txt
+tensorflow>=2.12
+tensorflow-probability>=0.20
+numpy
+pandas
+matplotlib
+xarray
+rioxarray
+rasterio
+scipy
