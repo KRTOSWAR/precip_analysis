@@ -9,7 +9,8 @@ from shapely.vectorized import contains
 # Configuration
 # ---------------------------------------------------------------------------
 INPUT_NC  = '../data/raw/Era5/ERA5_TP.nc'
-OUTPUT_NC = '../data/processed/era5_tp_mozambique.nc'
+OUTPUT_NC = '../data/processed/era5/era5_tp_mozambique.nc'
+
 
 os.makedirs(os.path.dirname(OUTPUT_NC), exist_ok=True)
 
