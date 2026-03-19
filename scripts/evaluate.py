@@ -45,6 +45,20 @@ Usage
   python evaluate.py --plot               # also save spatial maps
 """
 
+"""
+plot_results.py — Downscaling comparison plots (full-image mode).
+
+The ERA5 TP comparison panel is sourced directly from the last channel
+of X_test (denormalised from z-score) — no external .nc file needed.
+This guarantees the displayed ERA5 TP is exactly what the model saw.
+
+Usage
+-----
+  python plot_results.py                  # first test month
+  python plot_results.py --month 6        # month index 6
+  python plot_results.py --all            # every test month
+"""
+
 import os
 import argparse
 import numpy as np
@@ -53,24 +67,25 @@ import tensorflow as tf
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
+import matplotlib.ticker as mticker
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from downscaling import config as C
+import downscaling.config as C
 from downscaling.data_loader import (
     load_split, load_split_raw, load_land_mask,
-    load_norm_stats, invert_chirps_norm, predict_all
+    load_norm_stats, invert_chirps_norm, predict_full
 )
 from downscaling.models import (
-    build_unet_mse, build_unet_bg, build_unet_compound,
-    build_wgan_generator
+    build_unet_mse, build_unet_compound, build_wgan_generator
 )
-from downscaling.losses import _fss_single_3d
+
+PLOT_DIR = '../output/plots'
+os.makedirs(PLOT_DIR, exist_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Custom precipitation colormap  (shared with plot_results.py)
+# Custom precipitation colormap
 # ─────────────────────────────────────────────────────────────────────────────
 def make_cmap(high_vals=False, low_vals=False):
     precip_clevs = [0, 1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 40, 50, 70, 100, 150]
@@ -96,195 +111,173 @@ def make_cmap(high_vals=False, low_vals=False):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Denormalise ERA5 TP channel from X
+# Denormalise ERA5 TP from X  (z-score inverse, then upsample)
 # ─────────────────────────────────────────────────────────────────────────────
-def extract_era5_tp_mm(X_single: np.ndarray, norm_stats: dict,
-                        target_h: int, target_w: int) -> np.ndarray:
+def extract_era5_tp_mm(X_single: np.ndarray,
+                        norm_stats: dict,
+                        target_h: int,
+                        target_w: int) -> np.ndarray:
     """
-    Extract the TP channel from a single normalised ERA5 sample,
-    reverse the z-score, and bilinearly upsample to the CHIRPS grid.
+    Reverse the z-score on the TP channel (last channel of X) and
+    bilinearly upsample to the CHIRPS display grid.
 
-    Parameters
-    ----------
-    X_single  : (H_lr, W_lr, C)  normalised ERA5 — TP is channel index -1
-    norm_stats: dict with 'era5_mean' and 'era5_std'  shape (C,)
-    target_h  : CHIRPS grid height  (C.CHIRPS_H)
-    target_w  : CHIRPS grid width   (C.CHIRPS_W)
+    Note: TP in X uses plain z-score — NOT log1p — because it is an
+    input feature, not a target. The inverse is simply:
+        tp_mm = tp_norm * (std + 1e-8) + mean
 
     Returns
     -------
-    tp_mm : (target_h, target_w)  ERA5 TP in mm/month, clipped >= 0
+    tp_mm : (target_h, target_w)  in mm/month, clipped >= 0
     """
-    tp_idx  = X_single.shape[-1] - 1           # last channel is always TP
-    tp_norm = X_single[:, :, tp_idx]           # (H_lr, W_lr)
-
-    # Reverse z-score:  x_real = x_norm * std + mean
+    tp_idx  = X_single.shape[-1] - 1
+    tp_norm = X_single[:, :, tp_idx]
     mu      = norm_stats["era5_mean"][tp_idx]
     sigma   = norm_stats["era5_std"][tp_idx]
-    tp_real = tp_norm * (sigma + 1e-8) + mu    # mm/month at LR resolution
+    tp_real = tp_norm * (sigma + 1e-8) + mu
 
-    # Upsample to CHIRPS grid for display
-    tp_tensor = tf.image.resize(
-        tp_real[:, :, np.newaxis],              # (H_lr, W_lr, 1)
+    tp_hr = tf.image.resize(
+        tp_real[:, :, np.newaxis],
         [target_h, target_w],
         method=tf.image.ResizeMethod.BILINEAR
-    ).numpy()[:, :, 0]                          # (H_hr, W_hr)
+    ).numpy()[:, :, 0]
 
-    return np.maximum(tp_tensor, 0.0)
+    return np.maximum(tp_hr, 0.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Load a trained model from checkpoint
+# Load trained model
 # ─────────────────────────────────────────────────────────────────────────────
 def load_model(exp_name: str) -> tf.keras.Model:
-    builders = {
+    builders   = {
         "unet_mse"      : build_unet_mse,
-        "unet_bg"       : build_unet_bg,
         "unet_compound" : build_unet_compound,
         "wgan_compound" : build_wgan_generator,
     }
     ckpt_names = {
         "unet_mse"      : "best_model.keras",
-        "unet_bg"       : "best_model.keras",
         "unet_compound" : "best_model.keras",
         "wgan_compound" : "best_generator.keras",
     }
-    model     = builders[exp_name]()
-    ckpt_path = os.path.join(C.OUTPUT_DIR, exp_name, ckpt_names[exp_name])
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {ckpt_path}. Run train.py first."
-        )
-    model.load_weights(ckpt_path)
-    print(f"  Loaded {exp_name} from {ckpt_path}")
+    model = builders[exp_name]()
+    ckpt  = os.path.join(C.OUTPUT_DIR, exp_name, ckpt_names[exp_name])
+    if not os.path.exists(ckpt):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+    model.load_weights(ckpt)
+    print(f"  Loaded {exp_name}")
     return model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metric computation  (all values in mm/month, land pixels only)
+# Inference: single month → mm/month
 # ─────────────────────────────────────────────────────────────────────────────
-def compute_metrics(y_true_mm: np.ndarray,
-                    y_pred_mm: np.ndarray,
-                    land_mask: np.ndarray) -> dict:
-    lm = land_mask.astype(bool)
-    N  = y_true_mm.shape[0]
-
-    mae_list, mse_list, bias_list, corr_list = [], [], [], []
-    fss80_list, fss95_list, fss99_list       = [], [], []
-    r95p_bias_list, peak_err_list            = [], []
-
-    for i in range(N):
-        yt = y_true_mm[i, :, :, 0]
-        yp = y_pred_mm[i, :, :, 0]
-
-        valid = lm & np.isfinite(yt) & (yt >= 0)
-        if valid.sum() < 50:
-            continue
-
-        yt_l = yt[valid]
-        yp_l = yp[valid]
-
-        mae_list.append(np.mean(np.abs(yp_l - yt_l)))
-        mse_list.append(np.mean((yp_l - yt_l) ** 2))
-        bias_list.append(np.mean(yp_l - yt_l))
-
-        if np.std(yt_l) > 0 and np.std(yp_l) > 0:
-            corr_list.append(np.corrcoef(yt_l, yp_l)[0, 1])
-
-        r95p_bias_list.append(np.percentile(yp_l, 95) - np.percentile(yt_l, 95))
-        peak_err_list.append(yp_l.max() - yt_l.max())
-
-        lm_f   = lm.astype(np.float32)
-        yt_fss = tf.constant((yt * lm_f)[np.newaxis, :, :, np.newaxis], tf.float32)
-        yp_fss = tf.constant((yp * lm_f)[np.newaxis, :, :, np.newaxis], tf.float32)
-        fss80_list.append(float(_fss_single_3d(yt_fss[0], yp_fss[0], q=80, n=C.FSS_N)))
-        fss95_list.append(float(_fss_single_3d(yt_fss[0], yp_fss[0], q=95, n=C.FSS_N)))
-        fss99_list.append(float(_fss_single_3d(yt_fss[0], yp_fss[0], q=99, n=C.FSS_N)))
-
-    return {
-        "MAE"      : np.mean(mae_list),
-        "RMSE"     : np.sqrt(np.mean(mse_list)),
-        "Bias"     : np.mean(bias_list),
-        "Corr"     : np.mean(corr_list),
-        "FSS_80"   : np.mean(fss80_list),
-        "FSS_95"   : np.mean(fss95_list),
-        "FSS_99"   : np.mean(fss99_list),
-        "R95p_bias": np.mean(r95p_bias_list),
-        "Peak_err" : np.mean(peak_err_list),
-    }
+def predict_month_mm(model, X_single: np.ndarray,
+                     norm_stats: dict) -> np.ndarray:
+    """Single forward pass → invert log1p normalisation → mm/month."""
+    pred_norm = predict_full(model, X_single)       # (H_hr, W_hr, 1)
+    pred_mm   = invert_chirps_norm(pred_norm, norm_stats)
+    return pred_mm[:, :, 0]                         # (H_hr, W_hr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Spatial maps
+# Shared axis styling
 # ─────────────────────────────────────────────────────────────────────────────
-def _add_cbar(fig, ax, im, label, extend="max"):
+def _style_ax(ax, lons, lats, title):
+    ax.set_title(title, fontsize=9, fontweight="bold", pad=4)
+    ax.set_xlabel("Longitude", fontsize=8)
+    ax.set_ylabel("Latitude",  fontsize=8)
+    ax.xaxis.set_major_locator(mticker.MultipleLocator(2))
+    ax.yaxis.set_major_locator(mticker.MultipleLocator(2))
+    ax.tick_params(labelsize=7)
+    ax.set_xlim(lons.min(), lons.max())
+    ax.set_ylim(lats.min(), lats.max())
+    ax.grid(True, linewidth=0.3, alpha=0.4, color="grey")
+
+
+def _add_cbar(fig, ax, im, label):
     divider = make_axes_locatable(ax)
     cax     = divider.append_axes("right", size="4%", pad=0.06)
-    cb      = fig.colorbar(im, cax=cax, extend=extend)
+    cb      = fig.colorbar(im, cax=cax, extend="max")
     cb.set_label(label, fontsize=7)
     cb.ax.tick_params(labelsize=6)
 
 
-def plot_maps(y_true_mm, X_samples, pred_dict_mm,
-              land_mask, norm_stats, meta, out_dir, sample_idx=0):
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 1 — Absolute rainfall maps
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_absolute(chirps_mm, era5_tp_mm, pred_mse_mm, pred_wgan_mm,
+                  land_mask, lats, lons, month_label, out_path):
     """
-    4-panel map: CHIRPS truth | ERA5 TP (from X, denormed) | model predictions.
-
-    ERA5 TP uses the low_vals colormap (0–30 mm range) — consistent with
-    the coarse 0.5° resolution which smooths out rainfall peaks.
-    CHIRPS and predictions use the high_vals colormap (0–500 mm range).
+    4-panel figure.
+    - CHIRPS truth      → high_vals colormap  (0–500 mm)
+    - ERA5 TP (from X)  → low_vals  colormap  (0–30 mm)  — LR, full domain
+    - UNet prediction   → high_vals colormap  (0–500 mm)
+    - WGAN prediction   → high_vals colormap  (0–500 mm)
     """
-    lats = meta["chirps_lats"]
-    lons = meta["chirps_lons"]
-    lm   = land_mask.astype(bool)
-    ext  = [lons.min(), lons.max(), lats.min(), lats.max()]
+    cmap_hi,  norm_hi  = make_cmap(high_vals=True)
+    cmap_low, norm_low = make_cmap(low_vals=True)
+    ext = [lons.min(), lons.max(), lats.min(), lats.max()]
 
-    # ── ERA5 TP: denorm from X, upsample, no land mask (covers full domain)
-    era5_tp_mm = extract_era5_tp_mm(
-        X_samples[sample_idx], norm_stats, C.CHIRPS_H, C.CHIRPS_W
-    )
+    panels = [
+        (np.where(land_mask, chirps_mm,   np.nan), cmap_hi,  norm_hi,
+         "CHIRPS (truth)\n0.05° target"),
+        (era5_tp_mm,                                cmap_low, norm_low,
+         "ERA5 TP (input ch.6)\n0.50° low-res"),
+        (np.where(land_mask, pred_mse_mm,  np.nan), cmap_hi,  norm_hi,
+         "UNet-Compound\n0.05° prediction"),
+        (np.where(land_mask, pred_wgan_mm, np.nan), cmap_hi,  norm_hi,
+         "WGAN+Compound\n0.05° prediction"),
+    ]
 
-    # ── Colormaps
-    cmap_hi,  norm_hi  = make_cmap(high_vals=True)   # CHIRPS + predictions
-    cmap_low, norm_low = make_cmap(low_vals=True)     # ERA5 LR TP
-
-    n_models  = len(pred_dict_mm)
-    n_panels  = 2 + n_models      # truth + era5 + one per model
-    fig, axes = plt.subplots(1, n_panels,
-                              figsize=(4 * n_panels, 6),
-                              constrained_layout=True)
-
-    # Panel 0 — CHIRPS truth
-    yt = np.where(lm, y_true_mm[sample_idx, :, :, 0], np.nan)
-    im_hi = axes[0].imshow(yt, cmap=cmap_hi, norm=norm_hi,
-                            extent=ext, origin="upper", aspect="auto")
-    axes[0].set_title("CHIRPS (truth)\nhigh-res 0.05°", fontsize=9)
-    _add_cbar(fig, axes[0], im_hi, "mm/month")
-
-    # Panel 1 — ERA5 TP (low-res, from X_test channel 6, denormed)
-    im_low = axes[1].imshow(era5_tp_mm, cmap=cmap_low, norm=norm_low,
-                             extent=ext, origin="upper", aspect="auto")
-    axes[1].set_title("ERA5 TP (input channel)\nlow-res 0.50°", fontsize=9)
-    _add_cbar(fig, axes[1], im_low, "mm/month")
-
-    # Panels 2+ — model predictions
-    for ax, (name, preds_mm) in zip(axes[2:], pred_dict_mm.items()):
-        yp = np.where(lm, preds_mm[sample_idx, :, :, 0], np.nan)
-        im = ax.imshow(yp, cmap=cmap_hi, norm=norm_hi,
+    fig, axes = plt.subplots(1, 4, figsize=(24, 7), constrained_layout=True)
+    for ax, (data, cmap, norm, title) in zip(axes, panels):
+        im = ax.imshow(data, cmap=cmap, norm=norm,
                         extent=ext, origin="upper", aspect="auto")
-        ax.set_title(f"{C.EXPERIMENTS[name]}\nhigh-res 0.05°", fontsize=9)
+        _style_ax(ax, lons, lats, title)
         _add_cbar(fig, ax, im, "mm/month")
 
-    for ax in axes:
-        ax.set_xlabel("Lon", fontsize=8)
-        ax.set_ylabel("Lat", fontsize=8)
-        ax.tick_params(labelsize=7)
-        ax.grid(True, linewidth=0.3, alpha=0.4, color="grey")
-
-    plt.savefig(os.path.join(out_dir, f"map_sample_{sample_idx}.png"),
-                dpi=150, bbox_inches="tight")
+    fig.suptitle(f"Precipitation Downscaling — {month_label}  "
+                 f"(ERA5 0.50° → CHIRPS 0.05°)",
+                 fontsize=13, fontweight="bold")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  Saved map → {out_dir}/map_sample_{sample_idx}.png")
+    print(f"  Saved → {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 2 — Bias maps  (prediction − CHIRPS, land only)
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_bias(chirps_mm, era5_tp_mm, pred_mse_mm, pred_wgan_mm,
+              land_mask, lats, lons, month_label, out_path):
+    chirps_land = np.where(land_mask, chirps_mm, np.nan)
+    era5_land   = np.where(land_mask, era5_tp_mm, np.nan)
+
+    panels = [
+        (pred_mse_mm  - chirps_land, "UNet-Compound − CHIRPS"),
+        (pred_wgan_mm - chirps_land, "WGAN+Compound − CHIRPS"),
+        (era5_land    - chirps_land, "ERA5 TP − CHIRPS  (baseline)"),
+    ]
+    panels = [(np.where(land_mask, b, np.nan), t) for b, t in panels]
+
+    all_vals = np.concatenate([b[np.isfinite(b)] for b, _ in panels])
+    abs_max  = np.nanpercentile(np.abs(all_vals), 98)
+    ext      = [lons.min(), lons.max(), lats.min(), lats.max()]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6), constrained_layout=True)
+    for ax, (bias, title) in zip(axes, panels):
+        im   = ax.imshow(bias, cmap=plt.cm.RdBu_r,
+                          vmin=-abs_max, vmax=abs_max,
+                          extent=ext, origin="upper", aspect="auto")
+        land = bias[np.isfinite(bias)]
+        _style_ax(ax, lons, lats,
+                  f"{title}\nbias={np.nanmean(land):+.1f}  "
+                  f"RMSE={np.sqrt(np.nanmean(land**2)):.1f} mm/month")
+        _add_cbar(fig, ax, im, "mm/month")
+
+    fig.suptitle(f"Bias Maps (Pred − CHIRPS) — {month_label}",
+                 fontsize=13, fontweight="bold")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved → {out_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -292,63 +285,57 @@ def plot_maps(y_true_mm, X_samples, pred_dict_mm,
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exp", default="all",
-                        choices=list(C.EXPERIMENTS.keys()) + ["all"])
-    parser.add_argument("--plot", action="store_true")
+    parser.add_argument("--month", type=int, default=0)
+    parser.add_argument("--all",   action="store_true")
     args = parser.parse_args()
 
     print("Loading test data ...")
     X_test, _, times_test = load_split(C.TEST_FILE)
     y_test_raw            = load_split_raw(C.TEST_FILE)
-    land_mask             = load_land_mask(C.META_FILE)
+    land_mask             = load_land_mask(C.META_FILE).astype(bool)
     norm_stats            = load_norm_stats(C.META_FILE)
     meta                  = dict(np.load(C.META_FILE, allow_pickle=True))
 
-    print(f"  Test months  : {X_test.shape[0]}")
-    print(f"  X shape (LR) : {X_test.shape[1:]}  "
-          f"channels: {list(meta['channel_names'])}")
-    print(f"  Upsampled to : {C.UNET_INPUT_SHAPE}")
+    chirps_lats = meta["chirps_lats"]
+    chirps_lons = meta["chirps_lons"]
+    test_times  = pd.DatetimeIndex(times_test)
 
-    exps_to_run  = list(C.EXPERIMENTS.keys()) if args.exp == "all" else [args.exp]
-    all_results  = {}
-    pred_dict_mm = {}
+    print(f"  Test months  : {len(test_times)}")
+    print(f"  X channels   : {list(meta['channel_names'])}")
+    print(f"  TP channel   : index {X_test.shape[-1]-1}  "
+          f"(last channel — will be denormed for display)")
 
-    for exp_name in exps_to_run:
-        print(f"\nEvaluating: {C.EXPERIMENTS[exp_name]}")
-        try:
-            model      = load_model(exp_name)
-            preds_norm = predict_all(model, X_test, exp_name, norm_stats)
-            preds_mm   = invert_chirps_norm(preds_norm, norm_stats)
-            pred_dict_mm[exp_name] = preds_mm
+    print("\nLoading models ...")
+    model_compound = load_model("unet_compound")
+    model_wgan     = load_model("wgan_compound")
 
-            metrics = compute_metrics(y_test_raw, preds_mm, land_mask)
-            all_results[exp_name] = metrics
+    month_indices = list(range(len(test_times))) if args.all else [args.month]
 
-            print("  Metrics (mm/month):")
-            for k, v in metrics.items():
-                print(f"    {k:12s}: {v:.4f}")
-        except FileNotFoundError as e:
-            print(f"  SKIPPED — {e}")
+    for idx in month_indices:
+        if idx >= len(test_times):
+            print(f"  Skipping {idx} — only {len(test_times)} test months")
+            continue
 
-    if not all_results:
-        print("\nNo trained models found. Run train.py first.")
-        return
+        month_label = str(test_times[idx])[:7]
+        print(f"\nPlotting month {idx}: {month_label}")
 
-    df       = pd.DataFrame(all_results).T
-    df.index = [C.EXPERIMENTS[e] for e in df.index]
-    out_csv  = os.path.join(C.OUTPUT_DIR, "evaluation_results.csv")
-    df.to_csv(out_csv, float_format="%.4f")
-    print(f"\nResults saved to {out_csv}")
-    print("\n" + df.to_string())
+        chirps_map   = y_test_raw[idx, :, :, 0]
+        era5_tp_map  = extract_era5_tp_mm(
+            X_test[idx], norm_stats, C.CHIRPS_H, C.CHIRPS_W
+        )
 
-    if args.plot and pred_dict_mm:
-        maps_dir = os.path.join(C.OUTPUT_DIR, "maps")
-        os.makedirs(maps_dir, exist_ok=True)
-        for idx in [0, 6, 12]:
-            if idx < X_test.shape[0]:
-                plot_maps(y_test_raw, X_test, pred_dict_mm,
-                          land_mask, norm_stats, meta,
-                          maps_dir, sample_idx=idx)
+        pred_compound = predict_month_mm(model_compound, X_test[idx], norm_stats)
+        pred_wgan     = predict_month_mm(model_wgan,     X_test[idx], norm_stats)
+
+        out1 = os.path.join(PLOT_DIR, f"plot1_absolute_{month_label}.png")
+        plot_absolute(chirps_map, era5_tp_map, pred_compound, pred_wgan,
+                      land_mask, chirps_lats, chirps_lons, month_label, out1)
+
+        out2 = os.path.join(PLOT_DIR, f"plot2_bias_{month_label}.png")
+        plot_bias(chirps_map, era5_tp_map, pred_compound, pred_wgan,
+                  land_mask, chirps_lats, chirps_lons, month_label, out2)
+
+    print(f"\nAll plots saved to: {PLOT_DIR}")
 
 
 if __name__ == "__main__":
