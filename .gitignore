@@ -22,3 +22,37 @@ results/
 # OS
 .DS_Store
 Thumbs.db
+
+# Data — too large for Git (use DVC or cloud storage instead)
+data/
+results/
+*.nc
+*.npz
+*.tif
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environments
+.env
+*.env
+envs/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model checkpoints (large binary files)
+*.keras
+*.h5
+*.pt
+*.pth
